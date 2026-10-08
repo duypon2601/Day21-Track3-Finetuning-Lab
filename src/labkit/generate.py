@@ -25,6 +25,8 @@ def free_memory() -> None:
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
             torch.cuda.reset_peak_memory_stats()
+        elif torch.backends.mps.is_available():
+            torch.mps.empty_cache()
     except ImportError:      # pragma: no cover
         pass
 
@@ -34,6 +36,11 @@ def peak_vram_gb() -> float | None:
         import torch
         if torch.cuda.is_available():
             return torch.cuda.max_memory_allocated() / 1024 ** 3
+        if torch.backends.mps.is_available():
+            # MPS has no peak counter. This is what the Metal driver holds RIGHT NOW
+            # (weights + cached activations), read at the end of the run -- a floor on
+            # the true peak, not the peak itself. Say so wherever the number is quoted.
+            return torch.mps.driver_allocated_memory() / 1024 ** 3
     except ImportError:      # pragma: no cover
         pass
     return None
@@ -45,10 +52,17 @@ def load_base(tier: Tier, load_in_4bit: bool = False):
     `load_in_4bit` is exposed only so NB4 can *measure* the QLoRA contrast. The default
     is bf16 because the vendor advises against 4-bit on this model family (deck §13).
     """
+    import os
     import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
-    tok = AutoTokenizer.from_pretrained(tier.model_id, trust_remote_code=True)
+    # transformers 5.x materializes weights from a 4-thread pool. On Apple MPS that
+    # segfaults (exit 139) or spins forever at "Loading weights: 0%" -- measured on an
+    # M5 with torch 2.14.1 / transformers 5.19.0. Sequential loading costs ~7 s for 2B.
+    if device.describe()["device"] == "mps":
+        os.environ.setdefault("HF_DEACTIVATE_ASYNC_LOAD", "1")
+
+    tok =AutoTokenizer.from_pretrained(tier.model_id, trust_remote_code=True)
     # dtype (not torch_dtype — deprecated in transformers 5.x) and NOT hardcoded bf16:
     # the lab's default tier is a T4, which has no bfloat16 (see labkit/device.py).
     kwargs: dict = {"trust_remote_code": True, "dtype": device.torch_dtype(),
